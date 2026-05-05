@@ -8,11 +8,16 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from faster_whisper import WhisperModel
 
 # --- Configuration ---
+# Render Environment Variables ထဲမှာ TELEGRAM_TOKEN ဆိုပြီး ထည့်ထားပေးပါ
 TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Render Free RAM အတွက် tiny model ကို CPU ပေါ်မှာ အသက်သာဆုံး run ပါမယ်
+
+# Render Free RAM (512MB) အတွက် အသက်သာဆုံးဖြစ်အောင် tiny model ကို CPU ပေါ်မှာ run ပါမယ်
+# compute_type="int8" က RAM အစားသက်သာဆုံး ဖြစ်စေပါတယ်
+print("Loading AI Model... Please wait.")
 model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=1)
 
 # --- Render Port Error Fix (Dummy Server) ---
+# Web Service အဖြစ် တင်ရင် Port error မတက်အောင် ဟန်ပြ Server တစ်ခု ဖွင့်ထားခြင်း
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -26,57 +31,45 @@ def run_health_server():
 
 # --- Bot Logic ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 မင်္ဂလာပါ။ YouTube link ပေးပို့ပြီး Transcript ထုတ်ယူနိုင်ပါပြီ။ (Shorts ဗီဒီယိုများလည်း ရပါသည်)")
+    await update.message.reply_text("👋 မင်္ဂလာပါ။ YouTube link ပို့ပေးပါ။ Transcript ထုတ်ပေးပါမယ်။\n\n(Shorts ဗီဒီယိုများလည်း ရပါသည်)")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_url = update.message.text
     
-    # YouTube Link ဟုတ်မဟုတ် စစ်ဆေးခြင်း
+    # YouTube Link စစ်ဆေးခြင်း
     if "youtube.com" not in raw_url and "youtu.be" not in raw_url:
         await update.message.reply_text("❌ ကျေးဇူးပြု၍ မှန်ကန်သော YouTube Link ကိုသာ ပေးပို့ပါ။")
         return
 
-    # Shorts Link ဖြစ်ပါက ပုံမှန် Link အဖြစ် ပြောင်းလဲခြင်း
+    # Shorts Link ကို ပုံမှန် Link အဖြစ် ပြောင်းလဲခြင်း
     url = raw_url.replace("/shorts/", "/watch?v=")
     
     status_msg = await update.message.reply_text("⏳ ဗီဒီယိုကို ဖတ်နေပါတယ်။ ခဏစောင့်ပေးပါ...")
 
     try:
-        # yt-dlp နဲ့ ffmpeg သုံးပြီး RAM ထဲသို့ audio stream ဖတ်ခြင်း
-        command = [
-            'yt-dlp', '-o', '-', '-f', 'ba', '--no-playlist', url,
-            '|', 
-            'ffmpeg', '-i', 'pipe:0', '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', 'pipe:1'
-        ]
+        # yt-dlp + ffmpeg ကို သုံးပြီး RAM ထဲသို့ audio stream ဖတ်ခြင်း
+        # stderr=subprocess.DEVNULL ထည့်ထားလို့ အရင်ကတက်တဲ့ ffmpeg log error တွေ ပျောက်သွားပါလိမ့်မယ်
+        cmd = f'yt-dlp -o - -f ba --no-playlist "{url}" | ffmpeg -i pipe:0 -f s16le -acodec pcm_s16le -ar 16000 -ac 1 pipe:1'
         
-        cmd_string = " ".join(command)
-        process = subprocess.Popen(cmd_string, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # Audio data ဖတ်ယူခြင်း
-        audio_data, error_data = process.communicate()
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        audio_data, _ = process.communicate()
 
-        if not audio_data:
-            error_text = error_data.decode()
-            await update.message.reply_text(f"❌ Audio ဖတ်လို့ မရပါဘူး။\nError: {error_text[:100]}")
+        if not audio_data or len(audio_data) < 1000:
+            await update.message.reply_text("❌ Audio data ဖတ်လို့မရပါဘူး။ ဗီဒီယို link ကို ပြန်စစ်ပေးပါ။")
             return
 
         # Bytes ကို Whisper ဖတ်နိုင်သော format သို့ ပြောင်းခြင်း
         audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
 
-        # Transcription စတင်ခြင်း
-        segments, info = model.transcribe(audio_np, beam_size=1) # beam_size=1 က ပိုမြန်ပြီး RAM သက်သာစေသည်
+        # Transcription စတင်ခြင်း (beam_size=1 က RAM အသက်သာဆုံးနှင့် အမြန်ဆုံးပါ)
+        segments, _ = model.transcribe(audio_np, beam_size=1)
         
-        full_text = ""
-        for segment in segments:
-            full_text += f"{segment.text} "
+        full_text = " ".join([segment.text for segment in segments]).strip()
 
-        # ရလဒ် စစ်ဆေးခြင်း
-        full_text = full_text.strip()
-        
+        # ရလဒ် ပို့ပေးခြင်း
         if not full_text:
             await update.message.reply_text("⚠️ ဗီဒီယိုထဲမှာ စကားပြောသံ ရှာမတွေ့ပါဘူး။")
         elif len(full_text) > 4000:
-            # စာသား အရမ်းရှည်လျှင် File အနေနဲ့ ပို့ပေးမယ်
             file_path = "transcript.txt"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(full_text)
@@ -86,7 +79,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📝 **Transcript:**\n\n{full_text}")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ အမှားအယွင်း ဖြစ်သွားပါသည်- {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
     
     finally:
         await status_msg.delete()
@@ -106,4 +99,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
+
