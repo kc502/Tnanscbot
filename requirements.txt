@@ -1,4 +1,4 @@
 python-telegram-bot
-faster-whisper
 yt-dlp
-numpy
+groq
+pydub
