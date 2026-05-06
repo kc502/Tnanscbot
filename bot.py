@@ -1,63 +1,109 @@
 import os
-import subprocess
-import numpy as np
+import threading
+import yt_dlp
+import math
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from faster_whisper import WhisperModel
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from groq import Groq
+from pydub import AudioSegment
 
-# Render Environment Variables ထဲမှာ TELEGRAM_TOKEN ထည့်ထားပါ
-TOKEN = os.getenv("TELEGRAM_TOKEN")
+# --- Config ---
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
+PORT = int(os.environ.get("PORT", 8080))
 
-# RAM 512MB အတွက် အသက်သာဆုံးဖြစ်အောင် tiny model ကို သုံးပါမယ်
-print("Loading Model...")
-model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=1)
+client = Groq(api_key=GROQ_API_KEY)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Render Worker Bot Online! YouTube Link ပို့ပေးပါ။")
+# --- Render Health Check ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is active")
 
+def run_health_check():
+    httpd = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    httpd.serve_forever()
+
+# --- Utility: Split and Transcribe ---
+def process_audio_in_chunks(file_path):
+    audio = AudioSegment.from_file(file_path)
+    ten_minutes = 10 * 60 * 1000  # 10 minutes in milliseconds
+    chunks = math.ceil(len(audio) / ten_minutes)
+    
+    full_transcript = ""
+    
+    for i in range(chunks):
+        start_time = i * ten_minutes
+        end_time = (i + 1) * ten_minutes
+        chunk = audio[start_time:end_time]
+        
+        chunk_name = f"chunk_{i}.mp3"
+        chunk.export(chunk_name, format="mp3", bitrate="32k")
+        
+        with open(chunk_name, "rb") as f:
+            response = client.audio.transcriptions.create(
+                file=(chunk_name, f.read()),
+                model="whisper-large-v3",
+                response_format="text"
+            )
+            full_transcript += response + " "
+        
+        os.remove(chunk_name) # chunk ဖျက်မယ်
+        
+    return full_transcript
+
+# --- Bot Handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.replace("/shorts/", "/watch?v=")
-    if "youtube.com" not in url and "youtu.be" not in url: return
-    
-    status = await update.message.reply_text("⏳ AI က စာသားပြောင်းနေပါတယ်။ ခဏစောင့်ပါ။")
-    
-    try:
-        # YouTube Block ကျော်ရန် User-Agent ပါသော Command
-        cmd = (
-            f'yt-dlp -o - -f ba --no-playlist '
-            f'--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" '
-            f'"{url}" | ffmpeg -i pipe:0 -f s16le -acodec pcm_s16le -ar 16000 -ac 1 pipe:1'
-        )
-        
-        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        audio_data, _ = process.communicate()
-        
-        if not audio_data:
-            await update.message.reply_text("❌ Audio data ဖတ်လို့မရပါ။ (YouTube Blocked)")
-            return
+    url = update.message.text
+    if not ("youtube.com" in url or "youtu.be" in url):
+        return
 
-        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, _ = model.transcribe(audio_np, beam_size=1)
-        full_text = " ".join([segment.text for segment in segments]).strip()
+    user_id = update.message.from_user.id
+    temp_audio = f"raw_audio_{user_id}.mp3"
+    status_msg = await update.message.reply_text("⏳ စတင်နေပါပြီ...")
+
+    try:
+        # 1. Download Audio
+        await status_msg.edit_text("📥 Audio ဒေါင်းလုဒ်ဆွဲနေသည်...")
+        ydl_opts = {
+            'format': 'worstaudio/worst',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '32',
+            }],
+            'outtmpl': f"raw_audio_{user_id}",
+            'quiet': True,
+        }
         
-        if len(full_text) > 4000:
-            with open("result.txt", "w", encoding="utf-8") as f: f.write(full_text)
-            await update.message.reply_document(document=open("result.txt", "rb"))
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # 2. Chunking & Transcription
+        await status_msg.edit_text("✂️ Audio အပိုင်းခွဲပြီး Transcript ထုတ်နေသည်...")
+        final_text = process_audio_in_chunks(temp_audio)
+
+        # 3. Send back
+        if len(final_text) > 4000:
+            for i in range(0, len(final_text), 4000):
+                await update.message.reply_text(final_text[i:i+4000])
         else:
-            await update.message.reply_text(f"📝 Transcript:\n\n{full_text if full_text else 'စကားပြောသံ ရှာမတွေ့ပါ။'}")
+            await update.message.reply_text(f"📝 **Transcript:**\n\n{final_text}")
             
+        await status_msg.delete()
+
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
+    
     finally:
-        await status.delete()
-
-def main():
-    if not TOKEN: return
-    app = Application.builder().token(TOKEN).connect_timeout(60).read_timeout(60).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Worker is running...")
-    app.run_polling(drop_pending_updates=True)
+        if os.path.exists(temp_audio):
+            os.remove(temp_audio)
 
 if __name__ == '__main__':
-    main()
+    threading.Thread(target=run_health_check, daemon=True).start()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.run_polling()
+    
